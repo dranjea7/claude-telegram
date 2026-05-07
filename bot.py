@@ -39,13 +39,17 @@ def tg(method: str, **params) -> dict:
         return {}
 
 def send(chat_id: int, text: str, reply_to: int = None):
-    """Envoie un message en le découpant si > MAX_MSG_LEN."""
+    """Envoie un message en le découpant si > MAX_MSG_LEN. Fallback sans Markdown si erreur de parsing."""
     chunks = textwrap.wrap(text, MAX_MSG_LEN, replace_whitespace=False, break_long_words=True)
     for i, chunk in enumerate(chunks or [""]):
         params = dict(chat_id=chat_id, text=chunk, parse_mode="Markdown")
         if reply_to and i == 0:
             params["reply_to_message_id"] = reply_to
-        tg("sendMessage", **params)
+        result = tg("sendMessage", **params)
+        # Si Telegram rejette le Markdown, on renvoie en texte brut
+        if not result.get("ok"):
+            params.pop("parse_mode", None)
+            tg("sendMessage", **params)
 
 def send_typing(chat_id: int):
     tg("sendChatAction", chat_id=chat_id, action="typing")
