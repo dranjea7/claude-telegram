@@ -17,7 +17,7 @@ WORKDIR         = os.environ.get("WORKDIR", str(Path.home()))
 MAX_MSG_LEN     = 4000   # limite Telegram
 POLL_TIMEOUT    = 30     # long-polling timeout (sec)
 CLAUDE_TIMEOUT  = 300    # timeout max par requête claude (5 min)
-MAX_HISTORY     = 10     # nombre max d'échanges mémorisés par session
+SESSIONS_DIR    = Path("/root/claude-telegram/sessions")  # persistance sur disque
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("claude-tg")
@@ -55,23 +55,42 @@ def send(chat_id: int, text: str, reply_to: int = None):
 def send_typing(chat_id: int):
     tg("sendChatAction", chat_id=chat_id, action="typing")
 
-# ── Historique de conversation ────────────────────────────────────────────────
-def build_prompt(history: list[tuple], new_message: str) -> str:
-    """Construit un prompt enrichi de l'historique de la conversation."""
+# ── Historique de conversation (persistant sur disque) ───────────────────────
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+def session_file(chat_id: int) -> Path:
+    return SESSIONS_DIR / f"{chat_id}.json"
+
+def load_history(chat_id: int) -> list:
+    f = session_file(chat_id)
+    if f.exists():
+        try:
+            return json.loads(f.read_text())
+        except Exception:
+            return []
+    return []
+
+def save_history(chat_id: int, history: list):
+    try:
+        session_file(chat_id).write_text(json.dumps(history, ensure_ascii=False, indent=2))
+    except Exception as e:
+        log.error("Sauvegarde historique échouée : %s", e)
+
+def build_prompt(history: list, new_message: str) -> str:
+    """Construit un prompt avec tout l'historique de la conversation."""
     if not history:
         return new_message
-    lines = ["Voici l'historique de notre conversation (contexte uniquement, ne le résume pas) :\n"]
-    for user_msg, assistant_msg in history:
-        lines.append(f"Utilisateur : {user_msg}")
-        lines.append(f"Toi : {assistant_msg}\n")
+    lines = ["Voici l'intégralité de notre conversation (contexte, ne la résume pas) :\n"]
+    for entry in history:
+        lines.append(f"Utilisateur : {entry['user']}")
+        lines.append(f"Toi : {entry['assistant']}\n")
     lines.append(f"Utilisateur : {new_message}")
     return "\n".join(lines)
 
-def add_to_history(session: dict, user_msg: str, assistant_msg: str):
-    """Ajoute un échange à l'historique et tronque si nécessaire."""
-    session["history"].append((user_msg, assistant_msg))
-    if len(session["history"]) > MAX_HISTORY:
-        session["history"] = session["history"][-MAX_HISTORY:]
+def add_to_history(chat_id: int, session: dict, user_msg: str, assistant_msg: str):
+    """Ajoute un échange à l'historique et le persiste sur disque."""
+    session["history"].append({"user": user_msg, "assistant": assistant_msg})
+    save_history(chat_id, session["history"])
 
 # ── Claude runner ─────────────────────────────────────────────────────────────
 def run_claude(prompt: str, workdir: str = WORKDIR) -> str:
@@ -118,7 +137,7 @@ sessions: dict[int, dict] = {}
 
 def get_session(chat_id: int) -> dict:
     if chat_id not in sessions:
-        sessions[chat_id] = {"workdir": WORKDIR, "history": []}
+        sessions[chat_id] = {"workdir": WORKDIR, "history": load_history(chat_id)}
     return sessions[chat_id]
 
 # ── Gestionnaire de messages ──────────────────────────────────────────────────
@@ -176,7 +195,10 @@ def handle_message(msg: dict):
 
     if text == "/reset":
         sessions.pop(chat_id, None)
-        send(chat_id, "🔄 Session et mémoire réinitialisées.", reply_to=msg_id)
+        f = session_file(chat_id)
+        if f.exists():
+            f.unlink()
+        send(chat_id, "🔄 Mémoire complète effacée. Nouvelle conversation.", reply_to=msg_id)
         return
 
     if text == "/memory":
@@ -184,10 +206,12 @@ def handle_message(msg: dict):
         if not history:
             send(chat_id, "🧠 Aucun historique pour l'instant.", reply_to=msg_id)
         else:
-            lines = [f"🧠 *Mémoire* ({len(history)} échange(s)) :\n"]
-            for i, (u, a) in enumerate(history, 1):
-                lines.append(f"*{i}.* Toi : {u[:80]}{'…' if len(u)>80 else ''}")
-                lines.append(f"    Claude : {a[:80]}{'…' if len(a)>80 else ''}\n")
+            lines = [f"🧠 Mémoire complète : {len(history)} échange(s) enregistrés\n"]
+            for i, entry in enumerate(history, 1):
+                u = entry['user']
+                a = entry['assistant']
+                lines.append(f"{i}. Toi : {u[:80]}{'…' if len(u)>80 else ''}")
+                lines.append(f"   Claude : {a[:80]}{'…' if len(a)>80 else ''}\n")
             send(chat_id, "\n".join(lines), reply_to=msg_id)
         return
 
@@ -235,8 +259,8 @@ def handle_message(msg: dict):
     finally:
         stop_typing.set()
 
-    # Mémoriser l'échange
-    add_to_history(session, text, reply)
+    # Mémoriser l'échange (persisté sur disque)
+    add_to_history(chat_id, session, text, reply)
 
     send(chat_id, reply, reply_to=msg_id)
 
