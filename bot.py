@@ -53,7 +53,7 @@ def send_typing(chat_id: int):
 # ── Claude runner ─────────────────────────────────────────────────────────────
 def run_claude(prompt: str, workdir: str = WORKDIR) -> str:
     """Exécute `claude --print '<prompt>'` et retourne stdout."""
-    cmd = [CLAUDE_CMD, "--print", "--no-color", prompt]
+    cmd = [CLAUDE_CMD, "--print", prompt]
     try:
         result = subprocess.run(
             cmd,
