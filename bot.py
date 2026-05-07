@@ -17,6 +17,7 @@ WORKDIR         = os.environ.get("WORKDIR", str(Path.home()))
 MAX_MSG_LEN     = 4000   # limite Telegram
 POLL_TIMEOUT    = 30     # long-polling timeout (sec)
 CLAUDE_TIMEOUT  = 300    # timeout max par requête claude (5 min)
+MAX_HISTORY     = 10     # nombre max d'échanges mémorisés par session
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("claude-tg")
@@ -53,6 +54,24 @@ def send(chat_id: int, text: str, reply_to: int = None):
 
 def send_typing(chat_id: int):
     tg("sendChatAction", chat_id=chat_id, action="typing")
+
+# ── Historique de conversation ────────────────────────────────────────────────
+def build_prompt(history: list[tuple], new_message: str) -> str:
+    """Construit un prompt enrichi de l'historique de la conversation."""
+    if not history:
+        return new_message
+    lines = ["Voici l'historique de notre conversation (contexte uniquement, ne le résume pas) :\n"]
+    for user_msg, assistant_msg in history:
+        lines.append(f"Utilisateur : {user_msg}")
+        lines.append(f"Toi : {assistant_msg}\n")
+    lines.append(f"Utilisateur : {new_message}")
+    return "\n".join(lines)
+
+def add_to_history(session: dict, user_msg: str, assistant_msg: str):
+    """Ajoute un échange à l'historique et tronque si nécessaire."""
+    session["history"].append((user_msg, assistant_msg))
+    if len(session["history"]) > MAX_HISTORY:
+        session["history"] = session["history"][-MAX_HISTORY:]
 
 # ── Claude runner ─────────────────────────────────────────────────────────────
 def run_claude(prompt: str, workdir: str = WORKDIR) -> str:
@@ -113,7 +132,8 @@ Envoie n'importe quel message pour interroger Claude.
 `/run <cmd>` — exécuter une commande bash
 `/cd <path>` — changer le répertoire de travail
 `/pwd` — afficher le répertoire actuel
-`/reset` — réinitialiser la session
+`/reset` — effacer la mémoire et réinitialiser
+`/memory` — voir les échanges mémorisés
 `/status` — infos système
 `/id` — ton Telegram ID (pour le whitelist)
 
@@ -156,7 +176,19 @@ def handle_message(msg: dict):
 
     if text == "/reset":
         sessions.pop(chat_id, None)
-        send(chat_id, "🔄 Session réinitialisée.", reply_to=msg_id)
+        send(chat_id, "🔄 Session et mémoire réinitialisées.", reply_to=msg_id)
+        return
+
+    if text == "/memory":
+        history = session.get("history", [])
+        if not history:
+            send(chat_id, "🧠 Aucun historique pour l'instant.", reply_to=msg_id)
+        else:
+            lines = [f"🧠 *Mémoire* ({len(history)} échange(s)) :\n"]
+            for i, (u, a) in enumerate(history, 1):
+                lines.append(f"*{i}.* Toi : {u[:80]}{'…' if len(u)>80 else ''}")
+                lines.append(f"    Claude : {a[:80]}{'…' if len(a)>80 else ''}\n")
+            send(chat_id, "\n".join(lines), reply_to=msg_id)
         return
 
     if text == "/pwd":
@@ -185,7 +217,7 @@ def handle_message(msg: dict):
         send(chat_id, result, reply_to=msg_id)
         return
 
-    # ── Requête Claude ─────────────────────────────────────────────
+    # ── Requête Claude avec mémoire ────────────────────────────────
     send_typing(chat_id)
 
     # Thread pour maintenir le "typing..." pendant que Claude réfléchit
@@ -198,9 +230,13 @@ def handle_message(msg: dict):
     t.start()
 
     try:
-        reply = run_claude(text, workdir=session["workdir"])
+        prompt = build_prompt(session.get("history", []), text)
+        reply = run_claude(prompt, workdir=session["workdir"])
     finally:
         stop_typing.set()
+
+    # Mémoriser l'échange
+    add_to_history(session, text, reply)
 
     send(chat_id, reply, reply_to=msg_id)
 
